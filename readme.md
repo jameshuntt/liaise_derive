@@ -40,6 +40,18 @@ pub enum Code {
 }
 ```
 
+### The Resulting API
+When expanded, your enum gains powerful capabilities:
+
+```rust
+let err = Code::InvalidOrder { name: "alphabetical" };
+
+assert_eq!(err.code_id(), 1001);
+assert_eq!(err.render(), "SHELL-1001");
+assert_eq!(err.message(), "Invalid order: alphabetical");
+```
+
+
 ### `# feature std`
 
 ```rust
@@ -71,16 +83,6 @@ pub enum AbutCode {
 }
 ```
 
-### The Resulting API
-When expanded, your enum gains powerful capabilities:
-
-```rust
-let err = Code::InvalidOrder { name: "alphabetical" };
-
-assert_eq!(err.code_id(), 1001);
-assert_eq!(err.render(), "SHELL-1001");
-assert_eq!(err.message(), "Invalid order: alphabetical");
-```
 
 ---
 
