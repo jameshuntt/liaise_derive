@@ -1,20 +1,165 @@
+/// IMPORTS
 use proc_macro::TokenStream;
-use quote::{quote, ToTokens};
+use quote::quote;
 use syn::{
-    parse_macro_input,
-    spanned::Spanned,
-    Data, DeriveInput,
-    Expr,
-    Fields,
-    Lit,
-    Meta,
-    MetaNameValue,
-    punctuated::Punctuated,
-    Token,
+    Data, DeriveInput, Expr, Fields, Lit, Meta,
+    MetaNameValue, Path, Token, parse_macro_input,
+    punctuated::Punctuated, spanned::Spanned
 };
+mod error;
+use error::{E, errors};
 
+/// MACROS
+macro_rules! unwrap_or_report {
+    ($opt:expr, $span:expr, $variant:expr) => {
+        match $opt {
+            Some(val) => val,
+            // Pass $variant as an argument, don't try to "call" it
+            None => return errors($span, $variant).to_compile_error().into(),
+        }
+    };
+}
+#[allow(unused)]macro_rules! unwrap_and_map {
+    ($opt:expr, $span:expr, $variant:expr) => {
+        match &$opt {
+            Some(val) => &val, // Access the field here
+            other => return errors(error, $variant)
+        }
+    };
+    ($opt:expr, $span:expr, $variant:expr, $access:ident) => {
+        match &$opt {
+            Some(val) => val.$access, // Access the field here
+            other => return errors(error, $variant)
+        }
+    };
+}
 
+/// HELPERS
+fn has_attribute(attr: &Attribute, name: &str) -> bool { is_ident(attr.path(), name) }
 
+fn is_ident(path: &Path, name: &str) -> bool { path.is_ident(name) }
+
+fn parse_lit<T, F>(expr: &syn::Expr, variant: E, parser: F) -> syn::Result<T>
+where
+    F: FnOnce(&syn::Lit) -> syn::Result<T>,
+{
+    match expr {
+        syn::Expr::Lit(el) => parser(&el.lit),
+        other => Err(errors(other, variant)),
+    }
+}
+
+fn expect_str(expr: &syn::Expr, var: E) -> syn::Result<syn::LitStr> {
+    parse_lit(expr, var, |l| if let Lit::Str(s) = l {
+        Ok(s.clone())} else { Err(errors(l, var))
+    })
+}
+
+fn expect_u16(expr: &syn::Expr, var: E) -> syn::Result<u16> {
+    parse_lit(expr, var, |l| if let Lit::Int(i) = l {
+        i.base10_parse() } else { Err(errors(l, var))
+    })
+}
+
+/// PARSERS
+#[derive(Default)]
+struct LiaiseVariantAttr {
+    code: Option<u16>,
+    msg: Option<syn::LitStr>,
+    #[cfg(feature = "std")]
+    source: bool,
+}
+
+fn parse_liaise_variant_attr(attrs: &[syn::Attribute]) -> syn::Result<LiaiseVariantAttr> {
+    let mut out = LiaiseVariantAttr::default();
+    for attr in attrs {
+        if !has_attribute(attr, "liaise") { continue; }
+        // #[liaise(code = 1, msg = "...", source)]
+        let items: Punctuated<Meta, Token![,]> =
+            attr.parse_args_with(Punctuated::parse_terminated)?;
+        for meta in items {
+            match meta {
+                // Using expect_u16
+                Meta::NameValue(nv) if is_ident(&nv.path, "code") => {
+                    out.code = Some(expect_u16(&nv.value, E::code)?);
+                }
+                // Using expect_str
+                Meta::NameValue(nv) if is_ident(&nv.path, "msg") || is_ident(&nv.path, "message") => {
+                    out.msg = Some(expect_str(&nv.value, E::msg)?);
+                }
+                #[cfg(feature = "std")]
+                Meta::Path(p) if is_ident(&p, "source") => { out.source = true; }
+                #[cfg(feature = "std")]
+                // IMPORTANT: ignore prefix= on variants if someone accidentally copies it
+                Meta::NameValue(MetaNameValue { path, .. }) if is_ident(&path, "prefix") => {}
+                other => return Err(errors(other, E::unsupported)),
+            }
+        }
+    } Ok(out)
+}
+
+use syn::{Attribute, Result as SynResult};
+// 'std' needs Option for the 3-step fallback resolution.
+#[cfg(feature = "std")]      type ParserReturn = SynResult<Option<String>>;
+// 'no_std' just wants the string result directly.
+#[cfg(not(feature = "std"))] type ParserReturn = SynResult<String>;
+fn parse_error_prefix(attrs: &[Attribute]) -> ParserReturn {
+    // Shared Logic: The loop is the same for both, 
+    // we just change what we wrap the return value in.
+    for attr in attrs {
+        if !has_attribute(attr, "error_prefix") { continue; }
+        // Handle #[error_prefix("...")]
+        if let syn::Meta::List(list) = &attr.meta {
+            let lit: syn::LitStr = syn::parse2(list.tokens.clone())?;
+            #[cfg(feature = "std")]        return Ok(Some(lit.value()));
+            #[cfg(not(feature = "std"))]   return Ok(lit.value());
+        }
+        // Handle #[error_prefix = "..."]
+        if let syn::Meta::NameValue(nv) = &attr.meta {
+            if let syn::Expr::Lit(expr_lit) = &nv.value {
+                if let syn::Lit::Str(lit) = &expr_lit.lit {
+                    #[cfg(feature = "std")]        return Ok(Some(lit.value()));
+                    #[cfg(not(feature = "std"))]   return Ok(lit.value());
+                }
+            } return Err(errors(nv, E::error_prefix))
+        } return Err(errors(attr, E::error_prefix_2));
+    }
+    // --- FINAL DEFAULT ---
+    #[cfg(feature = "std")]       { Ok(None) } // Return None so the caller can check the next fallback
+    #[cfg(not(feature = "std"))]  { Ok("ERR".to_string()) } // Return the hard default for no_std
+}
+
+#[cfg(feature = "std")]
+fn parse_liaise_prefix(attrs: &[Attribute]) -> syn::Result<Option<String>> {
+    for attr in attrs {
+        if !has_attribute(attr, "liaise") { continue; }
+
+        // #[liaise(prefix = "ABUT")]
+        let items: Punctuated<Meta, Token![,]> = attr.parse_args_with(Punctuated::parse_terminated)?;
+        for meta in items {
+            match meta {
+                Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("prefix") => {
+                    let lit = match value {
+                        Expr::Lit(el) => el.lit,
+                        other => return Err(errors(other, E::prefix))
+                    };
+                    // let s = unwrap_and_map!(lit, v, E::prefix, value());
+                    let s = match lit {
+                        Lit::Str(ls) => ls.value(),
+                        other => return Err(errors(other, E::prefix))
+                    };
+                    // let s = unwrap_and_map!(lit, v, E::prefix, value());
+                    return Ok(Some(s));
+                }
+                other => return Err(errors(other, E::enum_prefix))
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// PROC MACROS
 #[proc_macro_derive(RegisterErrors, attributes(error_prefix))]
 pub fn derive_register_errors(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -23,20 +168,20 @@ pub fn derive_register_errors(input: TokenStream) -> TokenStream {
     let prefix = input
         .attrs
         .iter()
-        .find(|a| a.path().is_ident("error_prefix"))
+        .find(|a| has_attribute(a, "error_prefix"))
         .and_then(|a| a.parse_args::<syn::LitStr>().ok())
         .map(|s| s.value())
         .unwrap_or_else(|| "ERR".to_string());
 
-    let variants = if let Data::Enum(data) = &input.data {
-        &data.variants
-    } else {
-        return syn::Error::new_spanned(name, "RegisterErrors can only be derived for enums")
-            .to_compile_error()
-            .into();
-    };
+    let variants =
+        if let Data::Enum(data) = &input.data {
+            &data.variants
+        } else {
+            return errors(name, E::only_enums).to_compile_error().into();
+        };
 
-    let variant_idents: Vec<_> = variants.iter().map(|v| &v.ident).collect();
+    let variant_idents: Vec<_> = variants
+        .iter().map(|v| &v.ident).collect();
 
     let expanded = quote! {
         impl ::liaise::ErrorRegistry for #name {
@@ -51,17 +196,6 @@ pub fn derive_register_errors(input: TokenStream) -> TokenStream {
 
     TokenStream::from(expanded)
 }
-
-
-
-
-
-
-
-
-
-
-
 
 #[proc_macro_derive(LiaiseCodes, attributes(error_prefix, liaise))]
 pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
@@ -95,11 +229,7 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
 
     let variants = match &input.data {
         Data::Enum(d) => &d.variants,
-        _ => {
-            return syn::Error::new_spanned(name, "LiaiseCodes can only be derived for enums")
-                .to_compile_error()
-                .into();
-        }
+        _ => return errors(name, E::only_enums_2).to_compile_error().into()
     };
 
     struct Info {
@@ -122,23 +252,8 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
             Err(e) => return e.to_compile_error().into(),
         };
 
-        let code = match meta.code {
-            Some(c) => c,
-            None => {
-                return syn::Error::new(v.span(), "missing #[liaise(code = ...)] on variant")
-                    .to_compile_error()
-                    .into();
-            }
-        };
-
-        let msg = match meta.msg {
-            Some(m) => m,
-            None => {
-                return syn::Error::new(v.span(), "missing #[liaise(msg = \"...\")] on variant")
-                    .to_compile_error()
-                    .into();
-            }
-        };
+        let code    = unwrap_or_report!(meta.code, v, E::code_variant);
+        let msg  = unwrap_or_report!(meta.msg,  v, E::msg_variant);
         
         #[cfg(feature = "std")]
         let mut source_ty: Option<syn::Type> = None;
@@ -149,14 +264,7 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
                 Fields::Unnamed(u) if u.unnamed.len() == 1 => {
                     source_ty = Some(u.unnamed.first().unwrap().ty.clone());
                 }
-                _ => {
-                    return syn::Error::new(
-                        v.span(),
-                        "`source` is only valid on single-field tuple variants like `Io(std::io::Error)`",
-                    )
-                    .to_compile_error()
-                    .into();
-                }
+                _ => return errors(v, E::source).to_compile_error().into(),
             }
         }
 
@@ -307,256 +415,3 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
 
     TokenStream::from(expanded)
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// ERRORS
-fn msg_error<T: ToTokens>(other: T) -> syn::Error {
-    syn::Error::new_spanned(
-        other,
-        "liaise(msg = \"...\") expected",
-    )
-}
-
-fn code_error<T: ToTokens>(other: T) -> syn::Error {
-    syn::Error::new_spanned(
-        other,
-        "liaise(code = <u16 integer literal>) expected",
-    )
-}
-
-fn unsupported_error<T: ToTokens>(other: T) -> syn::Error {
-    syn::Error::new_spanned(
-        other,
-        "unsupported #[liaise(...)] item; expected code=, msg=, and/or source",
-    )
-}
-
-
-
-
-
-#[derive(Default)]
-struct LiaiseVariantAttr {
-    code: Option<u16>,
-    msg: Option<syn::LitStr>,
-    #[cfg(feature = "std")]
-    source: bool,
-}
-
-// done i think
-fn parse_liaise_variant_attr(attrs: &[syn::Attribute]) -> syn::Result<LiaiseVariantAttr> {
-    let mut out = LiaiseVariantAttr::default();
-
-    for attr in attrs {
-        if !attr.path().is_ident("liaise") { continue; }
-
-        // #[liaise(code = 1, msg = "...", source)]
-        let items: Punctuated<Meta, Token![,]> =
-            attr.parse_args_with(Punctuated::parse_terminated)?;
-
-        for meta in items {
-            match meta {
-                Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("code") => {
-                    let lit = match value {
-                        Expr::Lit(el) => el.lit,
-                        other => return Err(code_error(other)),
-                    };
-                    let n = match lit {
-                        Lit::Int(li) => li.base10_parse::<u16>()?,
-                        other => return Err(code_error(other)),
-                    };
-                    out.code = Some(n);
-                }
-
-                Meta::NameValue(MetaNameValue { path, value, .. })
-                    if path.is_ident("msg") || path.is_ident("message") =>
-                {
-                    let lit = match value {
-                        Expr::Lit(el) => el.lit,
-                        other => return Err(msg_error(other)),
-                    };
-                    let s = match lit {
-                        Lit::Str(ls) => ls,
-                        other => return Err(msg_error(other)),
-                    };
-                    out.msg = Some(s);
-                }
-
-                #[cfg(feature = "std")]
-                Meta::Path(p) if p.is_ident("source") => {
-                    out.source = true;
-                }
-
-                #[cfg(feature = "std")]
-                // IMPORTANT: ignore prefix= on variants if someone accidentally copies it
-                Meta::NameValue(MetaNameValue { path, .. }) if path.is_ident("prefix") => {}
-
-                other => return Err(unsupported_error(other)),
-
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-
-
-
-
-
-
-
-
-use syn::{Attribute, Result as SynResult};
-
-// --- CORRECTED GATES ---
-// 'std' needs Option for the 3-step fallback resolution.
-#[cfg(feature = "std")]
-type ParserReturn = SynResult<Option<String>>;
-
-// 'no_std' just wants the string result directly.
-#[cfg(not(feature = "std"))]
-type ParserReturn = SynResult<String>;
-
-fn parse_error_prefix(attrs: &[Attribute]) -> ParserReturn {
-    // Shared Logic: The loop is the same for both, 
-    // we just change what we wrap the return value in.
-    for attr in attrs {
-        if !attr.path().is_ident("error_prefix") {
-            continue;
-        }
-
-        // Handle #[error_prefix("...")]
-        if let syn::Meta::List(list) = &attr.meta {
-            let lit: syn::LitStr = syn::parse2(list.tokens.clone())?;
-            #[cfg(feature = "std")]
-            return Ok(Some(lit.value()));
-            #[cfg(not(feature = "std"))]
-            return Ok(lit.value());
-        }
-
-        // Handle #[error_prefix = "..."]
-        if let syn::Meta::NameValue(nv) = &attr.meta {
-            if let syn::Expr::Lit(expr_lit) = &nv.value {
-                if let syn::Lit::Str(lit) = &expr_lit.lit {
-                    #[cfg(feature = "std")]
-                    return Ok(Some(lit.value()));
-                    #[cfg(not(feature = "std"))]
-                    return Ok(lit.value());
-                }
-            }
-            return Err(syn::Error::new_spanned(nv, "expected #[error_prefix = \"ABUT\"]"));
-        }
-
-        return Err(syn::Error::new_spanned(
-            attr,
-            "expected #[error_prefix(\"ABUT\")] or #[error_prefix = \"ABUT\"]",
-        ));
-    }
-
-    // --- FINAL DEFAULT ---
-    #[cfg(feature = "std")]
-    { Ok(None) } // Return None so the caller can check the next fallback
-    #[cfg(not(feature = "std"))]
-    { Ok("ERR".to_string()) } // Return the hard default for no_std
-}
-
-
-#[cfg(feature = "std")]
-fn parse_liaise_prefix(attrs: &[Attribute]) -> syn::Result<Option<String>> {
-    for attr in attrs {
-        if !attr.path().is_ident("liaise") {
-            continue;
-        }
-
-        // #[liaise(prefix = "ABUT")]
-        let items: Punctuated<Meta, Token![,]> = attr.parse_args_with(Punctuated::parse_terminated)?;
-        for meta in items {
-            match meta {
-                Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("prefix") => {
-                    let lit = match value {
-                        Expr::Lit(el) => el.lit,
-                        other => {
-                            return Err(syn::Error::new_spanned(
-                                other,
-                                "liaise(prefix = \"ABUT\") expected",
-                            ));
-                        }
-                    };
-                    let s = match lit {
-                        Lit::Str(ls) => ls.value(),
-                        other => {
-                            return Err(syn::Error::new_spanned(
-                                other,
-                                "liaise(prefix = \"ABUT\") expected",
-                            ));
-                        }
-                    };
-                    return Ok(Some(s));
-                }
-                other => {
-                    // On the enum itself we only allow prefix=...
-                    return Err(syn::Error::new_spanned(
-                        other,
-                        "on the enum, #[liaise(...)] only supports prefix = \"...\"",
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(None)
-}
-
