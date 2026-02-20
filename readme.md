@@ -17,12 +17,12 @@ The "Diagnostic-First" update introduces a complete architectural overhaul, spli
 
 ## 🛠 Usage
 
-Define your error enum using the new unified attribute syntax:
+Define your error enum using the new unified attribute syntax (below example uses std):
 
 ```rust
 use liaise::{LiaiseCodes, RegisterErrors};
 
-#[derive(RegisterErrors, LiaiseCodes, Debug, Copy, Clone)]
+#[derive(LiaiseCodes, Debug, Copy, Clone)]
 #[liaise(prefix = "SHELL")] 
 pub enum Code {
     // 1xxx: Syntax Errors
@@ -37,6 +37,37 @@ pub enum Code {
     #[cfg(feature = "std")]
     #[liaise(code = 3001, msg = "System IO failure", source)]
     IoFailure(std::io::Error),
+}
+```
+
+### `# feature std`
+
+```rust
+use liaise::{LiaiseCodes, RegisterErrors};
+
+#[derive(LiaiseCodes)]
+#[liaise(prefix = "ABUT")]
+pub enum AbutCode {
+    #[liaise(code = 1, msg = "I/O failure", source)]
+    Io(std::io::Error),
+
+    #[liaise(code = 2, msg = "Buffer too small (need {needed} bytes)")]
+    BufferTooSmall { needed: usize },
+}
+```
+
+### `# no_std`
+```rust
+use liaise::{LiaiseCodes, RegisterErrors};
+
+#[derive(Copy, Clone, LiaiseCodes)]
+#[error_prefix("ABUT")]
+pub enum AbutCode {
+    #[liaise(code = 1, msg = "I/O failure")]
+    Io,
+
+    #[liaise(code = 2, msg = "Buffer too small (need {needed} bytes)")]
+    BufferTooSmall { needed: usize },
 }
 ```
 
