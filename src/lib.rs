@@ -401,8 +401,17 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
             }
         }
 
-        impl ::core::error::Error for #name {
-            fn source(&self) -> Option<&(dyn ::core::error::Error + 'static)> {
+        // impl ::core::error::Error for #name {
+        //     fn source(&self) -> Option<&(dyn ::core::error::Error + 'static)> {
+        //         match self {
+        //             #(#source_arms)*
+        //             _ => None,
+        //         }
+        //     }
+        // }
+
+        impl ::std::error::Error for #name {
+            fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
                 match self {
                     #(#source_arms)*
                     _ => None,
