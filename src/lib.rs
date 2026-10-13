@@ -1,426 +1,328 @@
-/// IMPORTS
 use proc_macro::TokenStream;
-use quote::quote;
-use syn::{
-    Data, DeriveInput, Expr, Fields, Lit, Meta,
-    MetaNameValue, Path, Token, parse_macro_input,
-    punctuated::Punctuated, spanned::Spanned
-};
+use quote::{format_ident, quote};
+use syn::{parse_macro_input, punctuated::Punctuated, Data, DeriveInput, Expr, Fields, Lit, Meta, MetaNameValue, Path, Token};
+
 mod error;
-use error::{E, errors};
+use error::{errors, E};
 
-/// MACROS
-macro_rules! unwrap_or_report {
-    ($opt:expr, $span:expr, $variant:expr) => {
-        match $opt {
-            Some(val) => val,
-            // Pass $variant as an argument, don't try to "call" it
-            None => return errors($span, $variant).to_compile_error().into(),
-        }
-    };
-}
-#[allow(unused)]macro_rules! unwrap_and_map {
-    ($opt:expr, $span:expr, $variant:expr) => {
-        match &$opt {
-            Some(val) => &val, // Access the field here
-            other => return errors(error, $variant)
-        }
-    };
-    ($opt:expr, $span:expr, $variant:expr, $access:ident) => {
-        match &$opt {
-            Some(val) => val.$access, // Access the field here
-            other => return errors(error, $variant)
-        }
-    };
-}
-
-/// HELPERS
-fn has_attribute(attr: &Attribute, name: &str) -> bool { is_ident(attr.path(), name) }
-
+fn has_attribute(attr: &syn::Attribute, name: &str) -> bool { attr.path().is_ident(name) }
 fn is_ident(path: &Path, name: &str) -> bool { path.is_ident(name) }
 
-fn parse_lit<T, F>(expr: &syn::Expr, variant: E, parser: F) -> syn::Result<T>
-where
-    F: FnOnce(&syn::Lit) -> syn::Result<T>,
-{
-    match expr {
-        syn::Expr::Lit(el) => parser(&el.lit),
-        other => Err(errors(other, variant)),
+/// Peel invisible `Expr::Group` wrappers. `macro_rules!` metavariables arrive
+/// wrapped in a `Delimiter::None` group, which `syn` parses as `Expr::Group`;
+/// without unwrapping, a literal fed through a macro fails the `Expr::Lit` match
+/// and the derive can't be used from any macro_rules caller.
+fn peel_groups(mut expr: &Expr) -> &Expr {
+    while let Expr::Group(group) = expr {
+        expr = &group.expr;
+    }
+    expr
+}
+
+fn expect_str(expr: &Expr) -> syn::Result<String> {
+    match peel_groups(expr) {
+        Expr::Lit(el) => match &el.lit {
+            Lit::Str(s) => Ok(s.value()),
+            other => Err(errors(other, E::BadString)),
+        },
+        other => Err(errors(other, E::BadString)),
     }
 }
 
-fn expect_str(expr: &syn::Expr, var: E) -> syn::Result<syn::LitStr> {
-    parse_lit(expr, var, |l| if let Lit::Str(s) = l {
-        Ok(s.clone())} else { Err(errors(l, var))
-    })
+fn expect_bool(expr: &Expr) -> syn::Result<bool> {
+    match peel_groups(expr) {
+        Expr::Lit(el) => match &el.lit {
+            Lit::Bool(b) => Ok(b.value),
+            other => Err(errors(other, E::BadBool)),
+        },
+        other => Err(errors(other, E::BadBool)),
+    }
 }
 
-fn expect_u16(expr: &syn::Expr, var: E) -> syn::Result<u16> {
-    parse_lit(expr, var, |l| if let Lit::Int(i) = l {
-        i.base10_parse() } else { Err(errors(l, var))
-    })
+fn expect_u16(expr: &Expr) -> syn::Result<u16> {
+    match peel_groups(expr) {
+        Expr::Lit(el) => match &el.lit {
+            Lit::Int(i) => i.base10_parse().map_err(|_| errors(i, E::BadCode)),
+            other => Err(errors(other, E::BadCode)),
+        },
+        other => Err(errors(other, E::BadCode)),
+    }
 }
 
-/// PARSERS
-#[derive(Default)]
-struct LiaiseVariantAttr {
+#[derive(Clone)]
+enum ValueSpec {
+    Literal(String),
+    Field(syn::Ident),
+}
+
+#[derive(Clone)]
+struct TokenSpec {
+    kind: String,
+    key: String,
+    value: ValueSpec,
+}
+
+#[derive(Default, Clone)]
+struct EnumAttr {
+    prefix: Option<String>,
+    domain: Option<String>,
+    version: Option<String>,
+}
+
+#[derive(Default, Clone)]
+struct VariantAttr {
     code: Option<u16>,
-    msg: Option<syn::LitStr>,
-    #[cfg(feature = "std")]
+    msg: Option<String>,
+    slug: Option<String>,
+    severity: Option<String>,
+    category: Option<String>,
+    stability: Option<String>,
+    help: Option<String>,
+    urgent: Option<bool>,
     source: bool,
+    tokens: Vec<TokenSpec>,
+    evidence: Vec<syn::Ident>,
+    digest: Vec<syn::Ident>,
 }
 
-fn parse_liaise_variant_attr(attrs: &[syn::Attribute]) -> syn::Result<LiaiseVariantAttr> {
-    let mut out = LiaiseVariantAttr::default();
+fn parse_enum_attr(attrs: &[syn::Attribute]) -> syn::Result<EnumAttr> {
+    let mut out = EnumAttr::default();
     for attr in attrs {
-        if !has_attribute(attr, "liaise") { continue; }
-        // #[liaise(code = 1, msg = "...", source)]
-        let items: Punctuated<Meta, Token![,]> =
-            attr.parse_args_with(Punctuated::parse_terminated)?;
-        for meta in items {
-            match meta {
-                // Using expect_u16
-                Meta::NameValue(nv) if is_ident(&nv.path, "code") => {
-                    out.code = Some(expect_u16(&nv.value, E::code)?);
-                }
-                // Using expect_str
-                Meta::NameValue(nv) if is_ident(&nv.path, "msg") || is_ident(&nv.path, "message") => {
-                    out.msg = Some(expect_str(&nv.value, E::msg)?);
-                }
-                #[cfg(feature = "std")]
-                Meta::Path(p) if is_ident(&p, "source") => { out.source = true; }
-                #[cfg(feature = "std")]
-                // IMPORTANT: ignore prefix= on variants if someone accidentally copies it
-                Meta::NameValue(MetaNameValue { path, .. }) if is_ident(&path, "prefix") => {}
-                other => return Err(errors(other, E::unsupported)),
+        if has_attribute(attr, "error_prefix") {
+            if let syn::Meta::List(list) = &attr.meta {
+                let lit: syn::LitStr = syn::parse2(list.tokens.clone())?;
+                out.prefix = Some(lit.value());
             }
+            continue;
         }
-    } Ok(out)
-}
-
-use syn::{Attribute, Result as SynResult};
-// 'std' needs Option for the 3-step fallback resolution.
-#[cfg(feature = "std")]      type ParserReturn = SynResult<Option<String>>;
-// 'no_std' just wants the string result directly.
-#[cfg(not(feature = "std"))] type ParserReturn = SynResult<String>;
-fn parse_error_prefix(attrs: &[Attribute]) -> ParserReturn {
-    // Shared Logic: The loop is the same for both, 
-    // we just change what we wrap the return value in.
-    for attr in attrs {
-        if !has_attribute(attr, "error_prefix") { continue; }
-        // Handle #[error_prefix("...")]
-        if let syn::Meta::List(list) = &attr.meta {
-            let lit: syn::LitStr = syn::parse2(list.tokens.clone())?;
-            #[cfg(feature = "std")]        return Ok(Some(lit.value()));
-            #[cfg(not(feature = "std"))]   return Ok(lit.value());
-        }
-        // Handle #[error_prefix = "..."]
-        if let syn::Meta::NameValue(nv) = &attr.meta {
-            if let syn::Expr::Lit(expr_lit) = &nv.value {
-                if let syn::Lit::Str(lit) = &expr_lit.lit {
-                    #[cfg(feature = "std")]        return Ok(Some(lit.value()));
-                    #[cfg(not(feature = "std"))]   return Ok(lit.value());
-                }
-            } return Err(errors(nv, E::error_prefix))
-        } return Err(errors(attr, E::error_prefix_2));
-    }
-    // --- FINAL DEFAULT ---
-    #[cfg(feature = "std")]       { Ok(None) } // Return None so the caller can check the next fallback
-    #[cfg(not(feature = "std"))]  { Ok("ERR".to_string()) } // Return the hard default for no_std
-}
-
-#[cfg(feature = "std")]
-fn parse_liaise_prefix(attrs: &[Attribute]) -> syn::Result<Option<String>> {
-    for attr in attrs {
         if !has_attribute(attr, "liaise") { continue; }
-
-        // #[liaise(prefix = "ABUT")]
         let items: Punctuated<Meta, Token![,]> = attr.parse_args_with(Punctuated::parse_terminated)?;
         for meta in items {
             match meta {
-                Meta::NameValue(MetaNameValue { path, value, .. }) if path.is_ident("prefix") => {
-                    let lit = match value {
-                        Expr::Lit(el) => el.lit,
-                        other => return Err(errors(other, E::prefix))
-                    };
-                    // let s = unwrap_and_map!(lit, v, E::prefix, value());
-                    let s = match lit {
-                        Lit::Str(ls) => ls.value(),
-                        other => return Err(errors(other, E::prefix))
-                    };
-                    // let s = unwrap_and_map!(lit, v, E::prefix, value());
-                    return Ok(Some(s));
-                }
-                other => return Err(errors(other, E::enum_prefix))
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "prefix") => out.prefix = Some(expect_str(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "domain") => out.domain = Some(expect_str(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "version") => out.version = Some(expect_str(&value)?),
+                other => return Err(errors(other, E::Unsupported)),
             }
         }
     }
-
-    Ok(None)
+    Ok(out)
 }
 
-/// PROC MACROS
+fn parse_value_spec(expr: &Expr) -> syn::Result<ValueSpec> {
+    match expr {
+        Expr::Lit(el) => match &el.lit {
+            Lit::Str(s) => Ok(ValueSpec::Literal(s.value())),
+            Lit::Int(i) => Ok(ValueSpec::Literal(i.base10_digits().to_string())),
+            other => Err(errors(other, E::BadString)),
+        },
+        Expr::Path(path) if path.path.segments.len() == 1 => Ok(ValueSpec::Field(path.path.segments.first().unwrap().ident.clone())),
+        other => Err(errors(other, E::Unsupported)),
+    }
+}
+
+fn parse_token_list(list: &syn::MetaList) -> syn::Result<Vec<TokenSpec>> {
+    let items: Punctuated<Meta, Token![,]> = list.parse_args_with(Punctuated::parse_terminated)?;
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            Meta::NameValue(MetaNameValue { path, value, .. }) => {
+                let key = path.segments.last().unwrap().ident.to_string();
+                out.push(TokenSpec { kind: key.clone(), key, value: parse_value_spec(&value)? });
+            }
+            other => return Err(errors(other, E::Unsupported)),
+        }
+    }
+    Ok(out)
+}
+
+fn parse_ident_list(list: &syn::MetaList) -> syn::Result<Vec<syn::Ident>> {
+    let paths: Punctuated<Path, Token![,]> = list.parse_args_with(Punctuated::parse_terminated)?;
+    Ok(paths.into_iter().map(|path| path.segments.last().unwrap().ident.clone()).collect())
+}
+
+fn parse_liaise_variant_attr(attrs: &[syn::Attribute]) -> syn::Result<VariantAttr> {
+    let mut out = VariantAttr::default();
+    for attr in attrs {
+        if !has_attribute(attr, "liaise") { continue; }
+        let items: Punctuated<Meta, Token![,]> = attr.parse_args_with(Punctuated::parse_terminated)?;
+        for meta in items {
+            match meta {
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "code") => out.code = Some(expect_u16(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "msg") || is_ident(&path, "message") || is_ident(&path, "error") => out.msg = Some(expect_str(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "slug") => out.slug = Some(expect_str(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "severity") => out.severity = Some(expect_str(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "category") => out.category = Some(expect_str(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "stability") => out.stability = Some(expect_str(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "help") => out.help = Some(expect_str(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "urgent") => out.urgent = Some(expect_bool(&value)?),
+                Meta::Path(path) if is_ident(&path, "source") => out.source = true,
+                Meta::List(list) if list.path.is_ident("token") => out.tokens.extend(parse_token_list(&list)?),
+                Meta::List(list) if list.path.is_ident("evidence") => out.evidence.extend(parse_ident_list(&list)?),
+                Meta::List(list) if list.path.is_ident("digest") => out.digest.extend(parse_ident_list(&list)?),
+                other => return Err(errors(other, E::Unsupported)),
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn kebab(input: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in input.chars().enumerate() {
+        if ch.is_uppercase() {
+            if index != 0 { out.push('-'); }
+            for lower in ch.to_lowercase() { out.push(lower); }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[proc_macro_derive(RegisterErrors, attributes(error_prefix))]
 pub fn derive_register_errors(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
-
-    let prefix = input
-        .attrs
-        .iter()
-        .find(|a| has_attribute(a, "error_prefix"))
-        .and_then(|a| a.parse_args::<syn::LitStr>().ok())
-        .map(|s| s.value())
-        .unwrap_or_else(|| "ERR".to_string());
-
-    let variants =
-        if let Data::Enum(data) = &input.data {
-            &data.variants
-        } else {
-            return errors(name, E::only_enums).to_compile_error().into();
-        };
-
-    let variant_idents: Vec<_> = variants
-        .iter().map(|v| &v.ident).collect();
-
+    let prefix = parse_enum_attr(&input.attrs).ok().and_then(|a| a.prefix).unwrap_or_else(|| "ERR".to_string());
+    let variants = match &input.data { Data::Enum(data) => &data.variants, _ => return errors(name, E::OnlyEnums).to_compile_error().into() };
+    let variant_idents: Vec<_> = variants.iter().map(|v| &v.ident).collect();
     let expanded = quote! {
         impl ::liaise::ErrorRegistry for #name {
             const PREFIX: &'static str = #prefix;
-            const ALL_CODES: &'static [u16] = &[
-                #( #name::#variant_idents as u16 ),*
-            ];
+            const ALL_CODES: &'static [u16] = &[ #( #name::#variant_idents as u16 ),* ];
         }
-
         const _: () = <#name as ::liaise::ErrorRegistry>::VALIDATE;
     };
-
-    TokenStream::from(expanded)
+    expanded.into()
 }
 
 #[proc_macro_derive(LiaiseCodes, attributes(error_prefix, liaise))]
 pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
+    let enum_attr = match parse_enum_attr(&input.attrs) { Ok(v) => v, Err(e) => return e.to_compile_error().into() };
+    let prefix = enum_attr.prefix.unwrap_or_else(|| "ERR".to_string());
+    let domain = enum_attr.domain.unwrap_or_else(|| "diagnostic".to_string());
+    let _version = enum_attr.version;
+    let variants = match &input.data { Data::Enum(d) => &d.variants, _ => return errors(name, E::OnlyEnums).to_compile_error().into() };
 
-    // 1. Unified Prefix Resolution
-    let prefix = {
-        // prefix resolution order:
-        // 1) #[liaise(prefix="...")]
-        // 2) #[error_prefix("...")] (your old form)
-        // 3) "ERR"
-        #[cfg(feature = "std")] {
-            match parse_liaise_prefix(&input.attrs) {
-                Ok(Some(p)) => p,
-                Ok(None) => match parse_error_prefix(&input.attrs) {
-                    Ok(Some(p)) => p,
-                    Ok(None) => "ERR".to_string(),
-                    Err(e) => return e.to_compile_error().into(),
-                },
-                Err(e) => return e.to_compile_error().into(),
-            }
-        }
-        #[cfg(not(feature = "std"))] {
-            match parse_error_prefix(&input.attrs) {
-                Ok(p) => p,
-                Err(e) => return e.to_compile_error().into(),
-            }
-        }
-    };
-
-    let variants = match &input.data {
-        Data::Enum(d) => &d.variants,
-        _ => return errors(name, E::only_enums_2).to_compile_error().into()
-    };
-
-    struct Info {
-        ident: syn::Ident,
-        fields: Fields,
-        code: u16,
-        msg: syn::LitStr,
-        #[cfg(feature = "std")]
-        source: bool,
-        #[cfg(feature = "std")]
-        source_ty: Option<syn::Type>,
-        span: proc_macro2::Span,
-    }
-
+    struct Info { ident: syn::Ident, fields: Fields, code: u16, msg: String, slug: String, severity: String, category: Option<String>, stability: String, help: Option<String>, urgent: Option<bool>, source_ty: Option<syn::Type>, tokens: Vec<TokenSpec>, evidence: Vec<syn::Ident> }
     let mut infos = Vec::<Info>::new();
-
     for v in variants {
-        let meta = match parse_liaise_variant_attr(&v.attrs) {
-            Ok(m) => m,
-            Err(e) => return e.to_compile_error().into(),
-        };
-
-        let code    = unwrap_or_report!(meta.code, v, E::code_variant);
-        let msg  = unwrap_or_report!(meta.msg,  v, E::msg_variant);
-        
-        #[cfg(feature = "std")]
-        let mut source_ty: Option<syn::Type> = None;
-
-        #[cfg(feature = "std")]
-        if meta.source {
+        let meta = match parse_liaise_variant_attr(&v.attrs) { Ok(m) => m, Err(e) => return e.to_compile_error().into() };
+        let code = match meta.code { Some(c) => c, None => return errors(v, E::MissingCode).to_compile_error().into() };
+        let msg = match meta.msg { Some(m) => m, None => return errors(v, E::MissingMessage).to_compile_error().into() };
+        // `source`: the variant's single tuple field is the underlying error. It becomes
+        // `Error::source()` and a `From<field type>` for the enum, so `?` lifts it.
+        let source_ty = if meta.source {
             match &v.fields {
-                Fields::Unnamed(u) if u.unnamed.len() == 1 => {
-                    source_ty = Some(u.unnamed.first().unwrap().ty.clone());
-                }
-                _ => return errors(v, E::source).to_compile_error().into(),
+                Fields::Unnamed(u) if u.unnamed.len() == 1 => Some(u.unnamed.first().unwrap().ty.clone()),
+                _ => return errors(v, E::Source).to_compile_error().into(),
             }
-        }
-
-        #[cfg(feature = "std")]
+        } else { None };
         infos.push(Info {
             ident: v.ident.clone(),
             fields: v.fields.clone(),
             code,
             msg,
-            source: meta.source,
+            slug: meta.slug.unwrap_or_else(|| kebab(&v.ident.to_string())),
+            severity: meta.severity.unwrap_or_else(|| "error".to_string()),
+            category: meta.category,
+            stability: meta.stability.unwrap_or_else(|| "experimental".to_string()),
+            help: meta.help,
+            urgent: meta.urgent,
             source_ty,
-            span: v.span(),
-        });
-        
-        #[cfg(not(feature = "std"))]
-        infos.push(Info {
-            ident: v.ident.clone(),
-            fields: v.fields.clone(),
-            code,
-            msg,
-            span: v.span(),
+            tokens: meta.tokens,
+            evidence: meta.evidence,
         });
     }
 
-    // ALL_CODES
-    let all_codes: Vec<u16> = infos.iter().map(|i| i.code).collect();
+    let all_codes: Vec<_> = infos.iter().map(|i| i.code).collect();
 
-    // match arms
-    let code_arms = infos.iter().map(|i| {
-        let vi = &i.ident;
-        let code = i.code;
-        match &i.fields {
-            Fields::Unit => quote! { Self::#vi => #code, },
-            Fields::Unnamed(_) => quote! { Self::#vi(..) => #code, },
-            Fields::Named(_) => quote! { Self::#vi { .. } => #code, },
-        }
+    let code_arms = infos.iter().map(|i| { let vi=&i.ident; let code=i.code; match &i.fields { Fields::Unit => quote!{ Self::#vi => #code, }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => #code, }, Fields::Named(_) => quote!{ Self::#vi { .. } => #code, }, } });
+    let slug_arms = infos.iter().map(|i| { let vi=&i.ident; let slug=&i.slug; match &i.fields { Fields::Unit => quote!{ Self::#vi => #slug, }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => #slug, }, Fields::Named(_) => quote!{ Self::#vi { .. } => #slug, }, } });
+    let msg_arms = infos.iter().map(|i| { let vi=&i.ident; let msg=&i.msg; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::std::format!(#msg), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::std::format!(#msg), }, Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::std::format!(#msg), } } } });
+    let severity_arms = infos.iter().map(|i| { let vi=&i.ident; let severity=&i.severity; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::LiaiseSeverity::from_label(#severity), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::LiaiseSeverity::from_label(#severity), }, Fields::Named(_) => quote!{ Self::#vi { .. } => ::liaise::LiaiseSeverity::from_label(#severity), }, } });
+    let stability_arms = infos.iter().map(|i| { let vi=&i.ident; let stability=&i.stability; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::LiaiseStability::from_label(#stability), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::LiaiseStability::from_label(#stability), }, Fields::Named(_) => quote!{ Self::#vi { .. } => ::liaise::LiaiseStability::from_label(#stability), }, } });
+    let category_arms = infos.iter().map(|i| { let vi=&i.ident; let cat=&i.category; match (cat, &i.fields) { (Some(cat), Fields::Unit) => quote!{ Self::#vi => Some(#cat), }, (Some(cat), Fields::Unnamed(_)) => quote!{ Self::#vi(..) => Some(#cat), }, (Some(cat), Fields::Named(_)) => quote!{ Self::#vi { .. } => Some(#cat), }, (None, Fields::Unit) => quote!{ Self::#vi => None, }, (None, Fields::Unnamed(_)) => quote!{ Self::#vi(..) => None, }, (None, Fields::Named(_)) => quote!{ Self::#vi { .. } => None, }, } });
+    let help_arms = infos.iter().map(|i| { let vi=&i.ident; let help=&i.help; match (help, &i.fields) { (Some(help), Fields::Unit) => quote!{ Self::#vi => Some(#help), }, (Some(help), Fields::Unnamed(_)) => quote!{ Self::#vi(..) => Some(#help), }, (Some(help), Fields::Named(_)) => quote!{ Self::#vi { .. } => Some(#help), }, (None, Fields::Unit) => quote!{ Self::#vi => None, }, (None, Fields::Unnamed(_)) => quote!{ Self::#vi(..) => None, }, (None, Fields::Named(_)) => quote!{ Self::#vi { .. } => None, }, } });
+
+    // A code's urgent mark (`urgent = true|false`), declared once with the code: only an enum that marks a code says so
+    // (`urgent_mark`); every other keeps the trait's default — unmarked, urgent by its severity (`Liaise::is_urgent`).
+    let urgent_marks = infos.iter().any(|i| i.urgent.is_some()).then(|| {
+        let arms = infos.iter().map(|i| {
+            let vi = &i.ident;
+            let mark = match i.urgent { Some(urgent) => quote!{ Some(#urgent) }, None => quote!{ None } };
+            match &i.fields { Fields::Unit => quote!{ Self::#vi => #mark, }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => #mark, }, Fields::Named(_) => quote!{ Self::#vi { .. } => #mark, } }
+        });
+        quote!{ fn urgent_mark(&self) -> Option<bool> { match self { #(#arms)* } } }
     });
 
-    let msg_arms = infos.iter().map(|i| {
-        let vi = &i.ident;
-        let msg = &i.msg;
-        match &i.fields {
-            Fields::Unit => quote! { Self::#vi => ::alloc::format!(#msg), },
-            // tuple variants can't bind named fields; keep it simple
-            Fields::Unnamed(_) => quote! { Self::#vi(..) => ::alloc::format!(#msg), },
-            Fields::Named(named) => {
-                let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap());
-                quote! { Self::#vi { #(#binds),* } => ::alloc::format!(#msg), }
+    let token_arms = infos.iter().map(|i| {
+        let vi=&i.ident;
+        let token_exprs = i.tokens.iter().map(|tok| {
+            let kind=&tok.kind; let key=&tok.key;
+            match &tok.value {
+                ValueSpec::Literal(value) => quote!{ ::liaise::LiaiseToken::new(#kind, #key, #value) },
+                ValueSpec::Field(field) => quote!{ ::liaise::LiaiseToken::new(#kind, #key, ::std::string::ToString::to_string(#field)) },
             }
+        });
+        match &i.fields {
+            Fields::Unit => quote!{ Self::#vi => ::std::vec![ #(#token_exprs),* ], },
+            Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::std::vec![ #(#token_exprs),* ], },
+            Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::std::vec![ #(#token_exprs),* ], } }
+        }
+    });
+    let evidence_arms = infos.iter().map(|i| {
+        let vi=&i.ident;
+        let evidence_exprs = i.evidence.iter().map(|field| { let key=field.to_string(); quote!{ ::liaise::LiaiseEvidence::new(#key, ::std::string::ToString::to_string(#field)) } });
+        match &i.fields {
+            Fields::Unit => quote!{ Self::#vi => ::std::vec![ #(#evidence_exprs),* ], },
+            Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::std::vec![ #(#evidence_exprs),* ], },
+            Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::std::vec![ #(#evidence_exprs),* ], } }
         }
     });
 
-    #[cfg(feature = "std")]
-    let source_arms = infos.iter().filter_map(|i| {
-        if !i.source {
-            return None;
-        }
-        let vi = &i.ident;
-        // match ergonomics will bind `src` as a reference because `self` is `&Self`
-        Some(quote! { Self::#vi(src) => Some(src), })
-    });
-    
+    let source_arms = infos.iter().filter(|i| i.source_ty.is_some()).map(|i| { let vi=&i.ident; quote!{ Self::#vi(src) => Some(src), } });
+    let from_impls = infos.iter().filter_map(|i| { let vi=&i.ident; let ty=i.source_ty.as_ref()?; Some(quote!{
+        impl ::core::convert::From<#ty> for #name { fn from(src: #ty) -> Self { Self::#vi(src) } }
+    }) });
 
-    #[cfg(feature = "std")]
-    let from_impls = infos.iter().filter_map(|i| {
-        let vi = &i.ident;
-        let ty = i.source_ty.as_ref()?;
-        Some(quote! {
-            impl From<#ty> for #name {
-                fn from(src: #ty) -> Self {
-                    Self::#vi(src)
-                }
-            }
-        })
-    });
-
-    #[cfg(not(feature = "std"))]
     let expanded = quote! {
         impl ::liaise::ErrorRegistry for #name {
             const PREFIX: &'static str = #prefix;
             const ALL_CODES: &'static [u16] = &[ #(#all_codes),* ];
         }
-
         const _: () = <#name as ::liaise::ErrorRegistry>::VALIDATE;
 
         impl ::liaise::Liaise for #name {
-            fn code_id(&self) -> u16 {
-                match self {
-                    #(#code_arms)*
-                }
-            }
-
-            fn message(&self) -> ::alloc::string::String {
-                match self {
-                    #(#msg_arms)*
-                }
-            }
+            fn code_id(&self) -> u16 { match self { #(#code_arms)* } }
+            fn domain(&self) -> &'static str { #domain }
+            fn slug(&self) -> &'static str { match self { #(#slug_arms)* } }
+            fn category(&self) -> Option<&'static str> { match self { #(#category_arms)* } }
+            fn severity(&self) -> ::liaise::LiaiseSeverity { match self { #(#severity_arms)* } }
+            fn stability(&self) -> ::liaise::LiaiseStability { match self { #(#stability_arms)* } }
+            fn message(&self) -> ::std::string::String { match self { #(#msg_arms)* } }
+            fn help(&self) -> Option<&'static str> { match self { #(#help_arms)* } }
+            #urgent_marks
+            fn tokens(&self) -> ::std::vec::Vec<::liaise::LiaiseToken> { match self { #(#token_arms)* } }
+            fn evidence(&self) -> ::std::vec::Vec<::liaise::LiaiseEvidence> { match self { #(#evidence_arms)* } }
         }
 
         impl ::core::fmt::Display for #name {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                // Liaise::render takes self by value; your traits require Copy, so this is fine.
-                write!(f, "{}", (*self).render())
+                write!(f, "{}", ::liaise::Liaise::render(self))
             }
         }
-    };
-    
-    #[cfg(feature = "std")]
-    let expanded = quote! {
-        impl ::liaise::ErrorRegistry for #name {
-            const PREFIX: &'static str = #prefix;
-            const ALL_CODES: &'static [u16] = &[ #(#all_codes),* ];
-        }
-
-        const _: () = <#name as ::liaise::ErrorRegistry>::VALIDATE;
-
-        impl ::liaise::Liaise for #name {
-            fn code_id(&self) -> u16 {
-                match self {
-                    #(#code_arms)*
-                }
-            }
-
-            fn message(&self) -> ::alloc::string::String {
-                match self {
-                    #(#msg_arms)*
-                }
-            }
-        }
-
-        impl ::core::fmt::Display for #name {
-            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                write!(f, "{}", self.render())
-            }
-        }
-
-        // impl ::core::error::Error for #name {
-        //     fn source(&self) -> Option<&(dyn ::core::error::Error + 'static)> {
-        //         match self {
-        //             #(#source_arms)*
-        //             _ => None,
-        //         }
-        //     }
-        // }
 
         impl ::std::error::Error for #name {
             fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
-                match self {
-                    #(#source_arms)*
-                    _ => None,
-                }
+                match self { #(#source_arms)* _ => None }
             }
         }
 
         #(#from_impls)*
     };
-
-    TokenStream::from(expanded)
+    expanded.into()
 }

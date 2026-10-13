@@ -1,15 +1,13 @@
 [package]
 name = "liaise_derive"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 
 license = "MIT OR Apache-2.0"
-description = "proc-macro helper for liaise code validation"
-
-authors = ["James Hunt <jameshuntdevelopment@gmail.com>"]
+description = "Proc-macro derive for Liaise diagnostic codes and reports."
 repository = "https://github.com/jameshuntt/liaise_derive"
-
 readme = "readme.md"
+authors = ["James Hunt <james@1o.business>"]
 
 [lib]
 proc-macro = true
@@ -22,4 +20,3 @@ std = []
 syn = { version = "2.0.114", features = ["full", "extra-traits"] }
 quote = "1.0.44"
 proc-macro2 = "1.0.106"
-proc-macro-crate = "3"
