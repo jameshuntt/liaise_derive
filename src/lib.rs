@@ -242,7 +242,7 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
 
     let code_arms = infos.iter().map(|i| { let vi=&i.ident; let code=i.code; match &i.fields { Fields::Unit => quote!{ Self::#vi => #code, }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => #code, }, Fields::Named(_) => quote!{ Self::#vi { .. } => #code, }, } });
     let slug_arms = infos.iter().map(|i| { let vi=&i.ident; let slug=&i.slug; match &i.fields { Fields::Unit => quote!{ Self::#vi => #slug, }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => #slug, }, Fields::Named(_) => quote!{ Self::#vi { .. } => #slug, }, } });
-    let msg_arms = infos.iter().map(|i| { let vi=&i.ident; let msg=&i.msg; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::std::format!(#msg), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::std::format!(#msg), }, Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::std::format!(#msg), } } } });
+    let msg_arms = infos.iter().map(|i| { let vi=&i.ident; let msg=&i.msg; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::__private::format!(#msg), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::__private::format!(#msg), }, Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::liaise::__private::format!(#msg), } } } });
     let severity_arms = infos.iter().map(|i| { let vi=&i.ident; let severity=&i.severity; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::LiaiseSeverity::from_label(#severity), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::LiaiseSeverity::from_label(#severity), }, Fields::Named(_) => quote!{ Self::#vi { .. } => ::liaise::LiaiseSeverity::from_label(#severity), }, } });
     let stability_arms = infos.iter().map(|i| { let vi=&i.ident; let stability=&i.stability; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::LiaiseStability::from_label(#stability), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::LiaiseStability::from_label(#stability), }, Fields::Named(_) => quote!{ Self::#vi { .. } => ::liaise::LiaiseStability::from_label(#stability), }, } });
     let category_arms = infos.iter().map(|i| { let vi=&i.ident; let cat=&i.category; match (cat, &i.fields) { (Some(cat), Fields::Unit) => quote!{ Self::#vi => Some(#cat), }, (Some(cat), Fields::Unnamed(_)) => quote!{ Self::#vi(..) => Some(#cat), }, (Some(cat), Fields::Named(_)) => quote!{ Self::#vi { .. } => Some(#cat), }, (None, Fields::Unit) => quote!{ Self::#vi => None, }, (None, Fields::Unnamed(_)) => quote!{ Self::#vi(..) => None, }, (None, Fields::Named(_)) => quote!{ Self::#vi { .. } => None, }, } });
@@ -265,22 +265,22 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
             let kind=&tok.kind; let key=&tok.key;
             match &tok.value {
                 ValueSpec::Literal(value) => quote!{ ::liaise::LiaiseToken::new(#kind, #key, #value) },
-                ValueSpec::Field(field) => quote!{ ::liaise::LiaiseToken::new(#kind, #key, ::std::string::ToString::to_string(#field)) },
+                ValueSpec::Field(field) => quote!{ ::liaise::LiaiseToken::new(#kind, #key, ::liaise::__private::ToString::to_string(#field)) },
             }
         });
         match &i.fields {
-            Fields::Unit => quote!{ Self::#vi => ::std::vec![ #(#token_exprs),* ], },
-            Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::std::vec![ #(#token_exprs),* ], },
-            Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::std::vec![ #(#token_exprs),* ], } }
+            Fields::Unit => quote!{ Self::#vi => ::liaise::__private::vec![ #(#token_exprs),* ], },
+            Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::__private::vec![ #(#token_exprs),* ], },
+            Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::liaise::__private::vec![ #(#token_exprs),* ], } }
         }
     });
     let evidence_arms = infos.iter().map(|i| {
         let vi=&i.ident;
-        let evidence_exprs = i.evidence.iter().map(|field| { let key=field.to_string(); quote!{ ::liaise::LiaiseEvidence::new(#key, ::std::string::ToString::to_string(#field)) } });
+        let evidence_exprs = i.evidence.iter().map(|field| { let key=field.to_string(); quote!{ ::liaise::LiaiseEvidence::new(#key, ::liaise::__private::ToString::to_string(#field)) } });
         match &i.fields {
-            Fields::Unit => quote!{ Self::#vi => ::std::vec![ #(#evidence_exprs),* ], },
-            Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::std::vec![ #(#evidence_exprs),* ], },
-            Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::std::vec![ #(#evidence_exprs),* ], } }
+            Fields::Unit => quote!{ Self::#vi => ::liaise::__private::vec![ #(#evidence_exprs),* ], },
+            Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::__private::vec![ #(#evidence_exprs),* ], },
+            Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::liaise::__private::vec![ #(#evidence_exprs),* ], } }
         }
     });
 
@@ -303,11 +303,11 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
             fn category(&self) -> Option<&'static str> { match self { #(#category_arms)* } }
             fn severity(&self) -> ::liaise::LiaiseSeverity { match self { #(#severity_arms)* } }
             fn stability(&self) -> ::liaise::LiaiseStability { match self { #(#stability_arms)* } }
-            fn message(&self) -> ::std::string::String { match self { #(#msg_arms)* } }
+            fn message(&self) -> ::liaise::__private::String { match self { #(#msg_arms)* } }
             fn help(&self) -> Option<&'static str> { match self { #(#help_arms)* } }
             #urgent_marks
-            fn tokens(&self) -> ::std::vec::Vec<::liaise::LiaiseToken> { match self { #(#token_arms)* } }
-            fn evidence(&self) -> ::std::vec::Vec<::liaise::LiaiseEvidence> { match self { #(#evidence_arms)* } }
+            fn tokens(&self) -> ::liaise::__private::Vec<::liaise::LiaiseToken> { match self { #(#token_arms)* } }
+            fn evidence(&self) -> ::liaise::__private::Vec<::liaise::LiaiseEvidence> { match self { #(#evidence_arms)* } }
         }
 
         impl ::core::fmt::Display for #name {
@@ -316,8 +316,8 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
             }
         }
 
-        impl ::std::error::Error for #name {
-            fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        impl ::liaise::__private::Error for #name {
+            fn source(&self) -> ::liaise::__private::Option<&(dyn ::liaise::__private::Error + 'static)> {
                 match self { #(#source_arms)* _ => None }
             }
         }
