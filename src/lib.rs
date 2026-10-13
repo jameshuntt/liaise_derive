@@ -1,5 +1,5 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
+use quote::{quote, ToTokens};
 use syn::{parse_macro_input, punctuated::Punctuated, Data, DeriveInput, Expr, Fields, Lit, Meta, MetaNameValue, Path, Token};
 
 mod error;
@@ -39,6 +39,29 @@ fn expect_bool(expr: &Expr) -> syn::Result<bool> {
     }
 }
 
+/// `code = 7` or `code = SOME_CONST`: an integer literal is checked to fit u16, any other
+/// expression is emitted as written (it must evaluate to a `u16` const).
+fn code_tokens(expr: &Expr) -> syn::Result<proc_macro2::TokenStream> {
+    match peel_groups(expr) {
+        Expr::Lit(el) => match &el.lit {
+            Lit::Int(i) => { i.base10_parse::<u16>().map_err(|_| errors(i, E::BadCode))?; Ok(i.to_token_stream()) }
+            other => Err(errors(other, E::BadCode)),
+        },
+        other => Ok(other.to_token_stream()),
+    }
+}
+
+/// `prefix = "ABUT"` or `prefix = PREFIX_CONST`.
+fn prefix_tokens(expr: &Expr) -> syn::Result<proc_macro2::TokenStream> {
+    match peel_groups(expr) {
+        Expr::Lit(el) => match &el.lit {
+            Lit::Str(s) => Ok(s.to_token_stream()),
+            other => Err(errors(other, E::BadString)),
+        },
+        other => Ok(other.to_token_stream()),
+    }
+}
+
 fn expect_u16(expr: &Expr) -> syn::Result<u16> {
     match peel_groups(expr) {
         Expr::Lit(el) => match &el.lit {
@@ -64,14 +87,14 @@ struct TokenSpec {
 
 #[derive(Default, Clone)]
 struct EnumAttr {
-    prefix: Option<String>,
+    prefix: Option<proc_macro2::TokenStream>,
     domain: Option<String>,
     version: Option<String>,
 }
 
 #[derive(Default, Clone)]
 struct VariantAttr {
-    code: Option<u16>,
+    code: Option<proc_macro2::TokenStream>,
     msg: Option<String>,
     slug: Option<String>,
     severity: Option<String>,
@@ -89,9 +112,12 @@ fn parse_enum_attr(attrs: &[syn::Attribute]) -> syn::Result<EnumAttr> {
     let mut out = EnumAttr::default();
     for attr in attrs {
         if has_attribute(attr, "error_prefix") {
-            if let syn::Meta::List(list) = &attr.meta {
-                let lit: syn::LitStr = syn::parse2(list.tokens.clone())?;
-                out.prefix = Some(lit.value());
+            match &attr.meta {
+                // #[error_prefix("ABUT")]
+                syn::Meta::List(list) => { let lit: syn::LitStr = syn::parse2(list.tokens.clone())?; out.prefix = Some(lit.to_token_stream()); }
+                // #[error_prefix = "ABUT"]   (the 0.1.x form)
+                syn::Meta::NameValue(MetaNameValue { value, .. }) => out.prefix = Some(prefix_tokens(value)?),
+                other => return Err(errors(other, E::BadString)),
             }
             continue;
         }
@@ -99,7 +125,7 @@ fn parse_enum_attr(attrs: &[syn::Attribute]) -> syn::Result<EnumAttr> {
         let items: Punctuated<Meta, Token![,]> = attr.parse_args_with(Punctuated::parse_terminated)?;
         for meta in items {
             match meta {
-                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "prefix") => out.prefix = Some(expect_str(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "prefix") => out.prefix = Some(prefix_tokens(&value)?),
                 Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "domain") => out.domain = Some(expect_str(&value)?),
                 Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "version") => out.version = Some(expect_str(&value)?),
                 other => return Err(errors(other, E::Unsupported)),
@@ -148,7 +174,7 @@ fn parse_liaise_variant_attr(attrs: &[syn::Attribute]) -> syn::Result<VariantAtt
         let items: Punctuated<Meta, Token![,]> = attr.parse_args_with(Punctuated::parse_terminated)?;
         for meta in items {
             match meta {
-                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "code") => out.code = Some(expect_u16(&value)?),
+                Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "code") => out.code = Some(code_tokens(&value)?),
                 Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "msg") || is_ident(&path, "message") || is_ident(&path, "error") => out.msg = Some(expect_str(&value)?),
                 Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "slug") => out.slug = Some(expect_str(&value)?),
                 Meta::NameValue(MetaNameValue { path, value, .. }) if is_ident(&path, "severity") => out.severity = Some(expect_str(&value)?),
@@ -184,7 +210,7 @@ fn kebab(input: &str) -> String {
 pub fn derive_register_errors(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
-    let prefix = parse_enum_attr(&input.attrs).ok().and_then(|a| a.prefix).unwrap_or_else(|| "ERR".to_string());
+    let prefix = parse_enum_attr(&input.attrs).ok().and_then(|a| a.prefix).unwrap_or_else(|| quote!{ "ERR" });
     let variants = match &input.data { Data::Enum(data) => &data.variants, _ => return errors(name, E::OnlyEnums).to_compile_error().into() };
     let variant_idents: Vec<_> = variants.iter().map(|v| &v.ident).collect();
     let expanded = quote! {
@@ -202,12 +228,12 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
     let enum_attr = match parse_enum_attr(&input.attrs) { Ok(v) => v, Err(e) => return e.to_compile_error().into() };
-    let prefix = enum_attr.prefix.unwrap_or_else(|| "ERR".to_string());
+    let prefix = enum_attr.prefix.unwrap_or_else(|| quote!{ "ERR" });
     let domain = enum_attr.domain.unwrap_or_else(|| "diagnostic".to_string());
     let _version = enum_attr.version;
     let variants = match &input.data { Data::Enum(d) => &d.variants, _ => return errors(name, E::OnlyEnums).to_compile_error().into() };
 
-    struct Info { ident: syn::Ident, fields: Fields, code: u16, msg: String, slug: String, severity: String, category: Option<String>, stability: String, help: Option<String>, urgent: Option<bool>, source_ty: Option<syn::Type>, tokens: Vec<TokenSpec>, evidence: Vec<syn::Ident> }
+    struct Info { ident: syn::Ident, fields: Fields, code: proc_macro2::TokenStream, msg: String, slug: String, severity: String, category: Option<String>, stability: String, help: Option<String>, urgent: Option<bool>, source_ty: Option<syn::Type>, tokens: Vec<TokenSpec>, evidence: Vec<syn::Ident> }
     let mut infos = Vec::<Info>::new();
     for v in variants {
         let meta = match parse_liaise_variant_attr(&v.attrs) { Ok(m) => m, Err(e) => return e.to_compile_error().into() };
@@ -238,9 +264,9 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
         });
     }
 
-    let all_codes: Vec<_> = infos.iter().map(|i| i.code).collect();
+    let all_codes: Vec<_> = infos.iter().map(|i| &i.code).collect();
 
-    let code_arms = infos.iter().map(|i| { let vi=&i.ident; let code=i.code; match &i.fields { Fields::Unit => quote!{ Self::#vi => #code, }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => #code, }, Fields::Named(_) => quote!{ Self::#vi { .. } => #code, }, } });
+    let code_arms = infos.iter().map(|i| { let vi=&i.ident; let code=&i.code; match &i.fields { Fields::Unit => quote!{ Self::#vi => #code, }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => #code, }, Fields::Named(_) => quote!{ Self::#vi { .. } => #code, }, } });
     let slug_arms = infos.iter().map(|i| { let vi=&i.ident; let slug=&i.slug; match &i.fields { Fields::Unit => quote!{ Self::#vi => #slug, }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => #slug, }, Fields::Named(_) => quote!{ Self::#vi { .. } => #slug, }, } });
     let msg_arms = infos.iter().map(|i| { let vi=&i.ident; let msg=&i.msg; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::__private::format!(#msg), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::__private::format!(#msg), }, Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::liaise::__private::format!(#msg), } } } });
     let severity_arms = infos.iter().map(|i| { let vi=&i.ident; let severity=&i.severity; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::LiaiseSeverity::from_label(#severity), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::LiaiseSeverity::from_label(#severity), }, Fields::Named(_) => quote!{ Self::#vi { .. } => ::liaise::LiaiseSeverity::from_label(#severity), }, } });
