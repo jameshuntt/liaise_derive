@@ -8,6 +8,25 @@ use error::{errors, E};
 fn has_attribute(attr: &syn::Attribute, name: &str) -> bool { attr.path().is_ident(name) }
 fn is_ident(path: &Path, name: &str) -> bool { path.is_ident(name) }
 
+/// The names a `format!` template captures inline: `{name}` / `{name:spec}`, skipping `{{` escapes.
+fn template_captures(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '{' { continue; }
+        if chars.peek() == Some(&'{') { chars.next(); continue; }
+        let name: String = chars.by_ref().take_while(|c| *c != '}' && *c != ':').collect();
+        out.push(name.trim().to_string());
+    }
+    out
+}
+
+/// A named variant's pattern binding only the fields an arm uses: `{ a, b, .. }`, or `{ .. }` when it uses none.
+fn named_binds(named: &syn::FieldsNamed, used: &[String]) -> proc_macro2::TokenStream {
+    let binds = named.named.iter().filter_map(|f| f.ident.as_ref()).filter(|id| used.iter().any(|u| *id == u));
+    quote!{ { #(#binds,)* .. } }
+}
+
 /// Peel invisible `Expr::Group` wrappers. `macro_rules!` metavariables arrive
 /// wrapped in a `Delimiter::None` group, which `syn` parses as `Expr::Group`;
 /// without unwrapping, a literal fed through a macro fails the `Expr::Lit` match
@@ -268,7 +287,7 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
 
     let code_arms = infos.iter().map(|i| { let vi=&i.ident; let code=&i.code; match &i.fields { Fields::Unit => quote!{ Self::#vi => #code, }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => #code, }, Fields::Named(_) => quote!{ Self::#vi { .. } => #code, }, } });
     let slug_arms = infos.iter().map(|i| { let vi=&i.ident; let slug=&i.slug; match &i.fields { Fields::Unit => quote!{ Self::#vi => #slug, }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => #slug, }, Fields::Named(_) => quote!{ Self::#vi { .. } => #slug, }, } });
-    let msg_arms = infos.iter().map(|i| { let vi=&i.ident; let msg=&i.msg; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::__private::format!(#msg), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::__private::format!(#msg), }, Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::liaise::__private::format!(#msg), } } } });
+    let msg_arms = infos.iter().map(|i| { let vi=&i.ident; let msg=&i.msg; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::__private::format!(#msg), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::__private::format!(#msg), }, Fields::Named(named) => { let binds = named_binds(named, &template_captures(msg)); quote!{ Self::#vi #binds => ::liaise::__private::format!(#msg), } } } });
     let severity_arms = infos.iter().map(|i| { let vi=&i.ident; let severity=&i.severity; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::LiaiseSeverity::from_label(#severity), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::LiaiseSeverity::from_label(#severity), }, Fields::Named(_) => quote!{ Self::#vi { .. } => ::liaise::LiaiseSeverity::from_label(#severity), }, } });
     let stability_arms = infos.iter().map(|i| { let vi=&i.ident; let stability=&i.stability; match &i.fields { Fields::Unit => quote!{ Self::#vi => ::liaise::LiaiseStability::from_label(#stability), }, Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::LiaiseStability::from_label(#stability), }, Fields::Named(_) => quote!{ Self::#vi { .. } => ::liaise::LiaiseStability::from_label(#stability), }, } });
     let category_arms = infos.iter().map(|i| { let vi=&i.ident; let cat=&i.category; match (cat, &i.fields) { (Some(cat), Fields::Unit) => quote!{ Self::#vi => Some(#cat), }, (Some(cat), Fields::Unnamed(_)) => quote!{ Self::#vi(..) => Some(#cat), }, (Some(cat), Fields::Named(_)) => quote!{ Self::#vi { .. } => Some(#cat), }, (None, Fields::Unit) => quote!{ Self::#vi => None, }, (None, Fields::Unnamed(_)) => quote!{ Self::#vi(..) => None, }, (None, Fields::Named(_)) => quote!{ Self::#vi { .. } => None, }, } });
@@ -297,7 +316,7 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
         match &i.fields {
             Fields::Unit => quote!{ Self::#vi => ::liaise::__private::vec![ #(#token_exprs),* ], },
             Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::__private::vec![ #(#token_exprs),* ], },
-            Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::liaise::__private::vec![ #(#token_exprs),* ], } }
+            Fields::Named(named) => { let used: Vec<String> = i.tokens.iter().filter_map(|tok| match &tok.value { ValueSpec::Field(f) => Some(f.to_string()), ValueSpec::Literal(_) => None }).collect(); let binds = named_binds(named, &used); quote!{ Self::#vi #binds => ::liaise::__private::vec![ #(#token_exprs),* ], } }
         }
     });
     let evidence_arms = infos.iter().map(|i| {
@@ -306,7 +325,7 @@ pub fn derive_liaise_codes(input: TokenStream) -> TokenStream {
         match &i.fields {
             Fields::Unit => quote!{ Self::#vi => ::liaise::__private::vec![ #(#evidence_exprs),* ], },
             Fields::Unnamed(_) => quote!{ Self::#vi(..) => ::liaise::__private::vec![ #(#evidence_exprs),* ], },
-            Fields::Named(named) => { let binds = named.named.iter().map(|f| f.ident.as_ref().unwrap()); quote!{ Self::#vi { #(#binds),* } => ::liaise::__private::vec![ #(#evidence_exprs),* ], } }
+            Fields::Named(named) => { let used: Vec<String> = i.evidence.iter().map(|f| f.to_string()).collect(); let binds = named_binds(named, &used); quote!{ Self::#vi #binds => ::liaise::__private::vec![ #(#evidence_exprs),* ], } }
         }
     });
 
