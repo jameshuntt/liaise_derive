@@ -2,6 +2,7 @@
 name = "liaise_derive"
 version = "0.3.4"
 edition = "2024"
+rust-version = "1.85"
 
 license = "MIT OR Apache-2.0"
 description = "Proc-macro derive for Liaise diagnostic codes and reports."

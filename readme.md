@@ -122,3 +122,8 @@ error: liaise(code = <u16 integer literal>) expected
 ---
 
 **Would you like me to generate a `CONTRIBUTING.md` that explains how the internal `error.rs` registry works for new developers?**
+
+## Releasing
+
+Bump `version` in Cargo.toml, add a dated `## <version> (YYYY-MM-DD)` entry to CHANGELOG.md, and push to
+`main`. CI (.github/workflows/ci.yml) runs the tests and clippy, then publishes that version to crates.io.
